@@ -23,7 +23,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 把这段话发给 Codex：
 
 ```text
-请帮助我在当前工作目录安装 Better Compact。先只读检查安装包中的 windows\Install.ps1 和现有 hooks.json，说明目标 workspace、将创建的目录、将注册的三个 Hook、备份位置及旧版残留。不要安装、修改 hooks.json 或删除文件，直到我明确确认。完成后提醒我到“设置 → 钩子”审阅并批准 Hook。
+请帮助我在当前工作目录安装 Better Compact https://github.com/Squ145L/Better-Compact/。先只读检查安装包中的 windows\Install.ps1 和现有 hooks.json，说明目标 workspace、将创建的目录、将注册的三个 Hook、备份位置及旧版残留。不要安装、修改 hooks.json 或删除文件，直到我明确确认。完成后提醒我到“设置 → 钩子”审阅并批准 Hook。
 ```
 
 ## 它怎么工作
