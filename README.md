@@ -9,7 +9,7 @@ Better Compact 在 Codex 压缩上下文或恢复会话后，自动补回必要�
 
 ### 方式一：手动安装
 
-双击 `Install.cmd`
+双击 `Install.cmd` 然后在 codex 设置最下方 钩子 三个都信任并允许
 
 或者
 

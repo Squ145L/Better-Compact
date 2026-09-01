@@ -10,6 +10,7 @@ $MetadataPath = Join-Path $ToolRoot 'install\install.json'
 $CodexHome = Join-Path $env:USERPROFILE '.codex'
 $HooksPath = Join-Path $CodexHome 'hooks.json'
 $HookScriptPath = Join-Path $PSScriptRoot 'continuity.ps1'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Get-Value($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -17,12 +18,14 @@ function Get-Value($Object, [string]$Name) {
     if ($null -eq $property) { return $null }
     return $property.Value
 }
+function Read-Utf8Text([string]$Path) { return [System.IO.File]::ReadAllText($Path, $Utf8NoBom) }
+function Write-JsonFile([string]$Path, $Value, [int]$Depth = 12) { [System.IO.File]::WriteAllText($Path, (($Value | ConvertTo-Json -Depth $Depth) + [Environment]::NewLine), $Utf8NoBom) }
 if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) { throw "Refusing to remove directory without Better Compact metadata: $ToolRoot" }
-try { $metadata = Get-Content -LiteralPath $MetadataPath -Raw | ConvertFrom-Json } catch { throw "Refusing to remove directory with invalid Better Compact metadata: $ToolRoot" }
+try { $metadata = Read-Utf8Text $MetadataPath | ConvertFrom-Json } catch { throw "Refusing to remove directory with invalid Better Compact metadata: $ToolRoot" }
 if (([string](Get-Value $metadata 'product')) -ne 'better-compact' -or ([string](Get-Value $metadata 'workspaceRoot')).TrimEnd([char]92) -ne $WorkspaceRoot) { throw "Refusing to remove directory not identified as this workspace's Better Compact installation: $ToolRoot" }
 
 if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
-    try { $hookConfig = Get-Content -LiteralPath $HooksPath -Raw | ConvertFrom-Json } catch { throw "Existing hooks.json is not valid JSON: $HooksPath" }
+    try { $hookConfig = Read-Utf8Text $HooksPath | ConvertFrom-Json } catch { throw "Existing hooks.json is not valid JSON: $HooksPath" }
     $changed = $false
     foreach ($eventName in @('SessionStart', 'PreToolUse', 'PostToolUse', 'PreCompact')) {
         $property = $hookConfig.hooks.PSObject.Properties[$eventName]
@@ -39,7 +42,7 @@ if (Test-Path -LiteralPath $HooksPath -PathType Leaf) {
     }
     if ($changed) {
         Copy-Item -LiteralPath $HooksPath -Destination "$HooksPath.better-compact-backup-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss')).json" -Force
-        $hookConfig | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $HooksPath -Encoding utf8
+        Write-JsonFile $HooksPath $hookConfig
     }
 }
 

@@ -9,7 +9,7 @@ if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) { New-Item -ItemType 
 
 Write-Host "Watching Better Compact diagnostics: $LogPath" -ForegroundColor Cyan
 Write-Host 'Press Ctrl+C to stop.' -ForegroundColor DarkGray
-Get-Content -LiteralPath $LogPath -Tail $Tail -Wait | ForEach-Object {
+Get-Content -LiteralPath $LogPath -Encoding utf8 -Tail $Tail -Wait | ForEach-Object {
     try {
         $event = $_ | ConvertFrom-Json
         $color = switch ($event.outcome) { 'recorded' { 'Green' } 'reloaded' { 'Green' } 'failed' { 'Red' } 'skipped' { 'Yellow' } 'ignored' { 'DarkGray' } default { 'White' } }

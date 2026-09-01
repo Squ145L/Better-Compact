@@ -39,6 +39,7 @@ $MetadataPath = Join-Path $InstallRoot 'install.json'
 $CodexHome = Join-Path $env:USERPROFILE '.codex'
 $HooksPath = Join-Path $CodexHome 'hooks.json'
 $HookScriptPath = Join-Path $RuntimeRoot 'continuity.ps1'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Get-Value($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -46,10 +47,11 @@ function Get-Value($Object, [string]$Name) {
     if ($null -eq $property) { return $null }
     return $property.Value
 }
+function Read-Utf8Text([string]$Path) { return [System.IO.File]::ReadAllText($Path, $Utf8NoBom) }
 function Assert-ExistingToolIsBetterCompact {
     if (-not (Test-Path -LiteralPath $ToolRoot -PathType Container)) { return $false }
     if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) { throw "Refusing to overwrite unknown directory: $ToolRoot" }
-    try { $metadata = Get-Content -LiteralPath $MetadataPath -Raw | ConvertFrom-Json } catch { throw "Refusing to overwrite directory with invalid Better Compact metadata: $ToolRoot" }
+    try { $metadata = Read-Utf8Text $MetadataPath | ConvertFrom-Json } catch { throw "Refusing to overwrite directory with invalid Better Compact metadata: $ToolRoot" }
     if (([string](Get-Value $metadata 'product')) -ne 'better-compact' -or ([string](Get-Value $metadata 'workspaceRoot')).TrimEnd([char]92) -ne $WorkspaceRoot) {
         throw "Refusing to overwrite directory not identified as this workspace's Better Compact installation: $ToolRoot"
     }
@@ -57,11 +59,11 @@ function Assert-ExistingToolIsBetterCompact {
 }
 function Read-HookConfig {
     if (-not (Test-Path -LiteralPath $HooksPath -PathType Leaf)) { return [pscustomobject]@{ hooks = [pscustomobject]@{} } }
-    try { return Get-Content -LiteralPath $HooksPath -Raw | ConvertFrom-Json } catch { throw "Existing hooks.json is not valid JSON: $HooksPath" }
+    try { return Read-Utf8Text $HooksPath | ConvertFrom-Json } catch { throw "Existing hooks.json is not valid JSON: $HooksPath" }
 }
 function Write-JsonFile([string]$Path, $Value, [int]$Depth = 12) {
     $json = $Value | ConvertTo-Json -Depth $Depth
-    [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, $Utf8NoBom)
 }
 function Ensure-HookEvent($Config, [string]$EventName) {
     if ($null -eq $Config.hooks) { $Config | Add-Member -NotePropertyName hooks -NotePropertyValue ([pscustomobject]@{}) -Force }
@@ -112,7 +114,7 @@ Copy-Item -LiteralPath (Join-Path $SourceRoot 'prompts\task-state.md') -Destinat
 foreach ($sourceFile in @('continuity.ps1', 'Control.ps1', 'Watch-ContinuityDiagnostics.ps1', 'Uninstall.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $sourceFile) -Destination (Join-Path $RuntimeRoot $sourceFile) -Force }
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { Write-JsonFile $ConfigPath ([ordered]@{ schemaVersion = 1; coreEnabled = $true; taskStateEnabled = $true }) }
 
-$previousMetadata = if ($isUpgrade) { Get-Content -LiteralPath $MetadataPath -Raw | ConvertFrom-Json } else { $null }
+$previousMetadata = if ($isUpgrade) { Read-Utf8Text $MetadataPath | ConvertFrom-Json } else { $null }
 [ordered]@{
     schemaVersion = 1; product = 'better-compact'; workspaceRoot = $WorkspaceRoot
     installedAtUtc = if ($previousMetadata) { [string](Get-Value $previousMetadata 'installedAtUtc') } else { [DateTime]::UtcNow.ToString('o') }

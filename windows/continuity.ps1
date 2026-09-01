@@ -16,6 +16,12 @@ $LogDirectory = Join-Path $ToolRoot 'logs'
 $DiagnosticPath = Join-Path $LogDirectory 'continuity-diagnostic.jsonl'
 $AuditPath = Join-Path $LogDirectory 'recovery-audit.jsonl'
 $TaskStatePromptPath = Join-Path $ToolRoot 'prompts\task-state.md'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8NoBom
+[Console]::OutputEncoding = $Utf8NoBom
+
+function Read-Utf8Text([string]$Path) { return [System.IO.File]::ReadAllText($Path, $Utf8NoBom) }
+function Write-Utf8Text([string]$Path, [string]$Text) { [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom) }
 
 function Get-Value($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -29,7 +35,7 @@ function Read-Config {
     $default = [pscustomobject]@{ coreEnabled = $true; taskStateEnabled = $true }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $default }
     try {
-        $parsed = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        $parsed = Read-Utf8Text $ConfigPath | ConvertFrom-Json
         if ($null -eq $parsed) { return $default }
         return [pscustomobject]@{
             coreEnabled = if ($null -eq (Get-Value $parsed 'coreEnabled')) { $true } else { [bool](Get-Value $parsed 'coreEnabled') }
@@ -42,7 +48,7 @@ $config = Read-Config
 if (-not $config.coreEnabled) { exit 0 }
 New-Item -ItemType Directory -Force -Path $RecoveryDirectory, $LogDirectory | Out-Null
 
-function Write-JsonLine([string]$Path, $Value) { ($Value | ConvertTo-Json -Depth 12 -Compress) | Add-Content -LiteralPath $Path -Encoding utf8 }
+function Write-JsonLine([string]$Path, $Value) { [System.IO.File]::AppendAllText($Path, (($Value | ConvertTo-Json -Depth 12 -Compress) + [Environment]::NewLine), $Utf8NoBom) }
 function Write-Diagnostic([string]$Stage, [string]$Outcome, [string]$Project, [string]$Detail, $Event) {
     Write-JsonLine $DiagnosticPath ([ordered]@{
         timestampUtc = [DateTime]::UtcNow.ToString('o'); stage = $Stage; outcome = $Outcome; project = $Project
@@ -56,12 +62,12 @@ function Write-Audit([string]$Stage, [string]$Project, [string]$Detail, $Event) 
 function Get-PathKey([string]$Path) { return [System.IO.Path]::GetFullPath($Path).TrimEnd([char]92).ToLowerInvariant() }
 function Read-ActiveProjects {
     if (-not (Test-Path -LiteralPath $ActivePath -PathType Leaf)) { return [pscustomobject]@{} }
-    try { return Get-Content -LiteralPath $ActivePath -Raw | ConvertFrom-Json } catch { return [pscustomobject]@{} }
+    try { return Read-Utf8Text $ActivePath | ConvertFrom-Json } catch { return [pscustomobject]@{} }
 }
 function Set-ActiveProject([string]$Cwd, [string]$Project) {
     $active = Read-ActiveProjects; $key = Get-PathKey $Cwd; $property = $active.PSObject.Properties[$key]
     if ($null -eq $property) { $active | Add-Member -NotePropertyName $key -NotePropertyValue $Project } else { $property.Value = $Project }
-    $active | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ActivePath -Encoding utf8
+    Write-Utf8Text $ActivePath (($active | ConvertTo-Json -Depth 6) + [Environment]::NewLine)
 }
 function Get-ActiveProject([string]$Cwd) {
     $active = Read-ActiveProjects
@@ -109,7 +115,7 @@ function Test-ApplyPatchSucceeded($Event) {
 }
 function Read-ContextFile([string]$Label, [string]$Path, [int]$Limit = 5000) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    $text = Get-Content -LiteralPath $Path -Raw
+    $text = Read-Utf8Text $Path
     if ($Limit -gt 0 -and $text.Length -gt $Limit) { $text = $text.Substring(0, $Limit) + "`n[truncated]" }
     return "### ${Label}: $Path`n$text"
 }
@@ -127,7 +133,7 @@ function Get-RecoveryCardPath([string]$Project) { return Join-Path $RecoveryDire
 function Read-RecoveryCard([string]$Project) {
     $path = Get-RecoveryCardPath $Project
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try { return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { return $null }
+    try { return Read-Utf8Text $path | ConvertFrom-Json } catch { return $null }
 }
 function Write-RecoveryCard([string]$Project, [string[]]$Targets, $Event) {
     $previous = Read-RecoveryCard $Project; $files = New-Object System.Collections.Generic.List[string]
@@ -138,19 +144,19 @@ function Write-RecoveryCard([string]$Project, [string[]]$Targets, $Event) {
         schemaVersion = 1; project = $Project; lastSuccessfulEditAt = [DateTime]::UtcNow.ToString('o'); lastSuccessfulEditSessionId = [string](Get-Value $Event 'session_id')
         lastCompactedAt = Get-Value $previous 'lastCompactedAt'; lastCompactedSessionId = Get-Value $previous 'lastCompactedSessionId'; files = @($files)
     }
-    $card | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Get-RecoveryCardPath $Project) -Encoding utf8
+    Write-Utf8Text (Get-RecoveryCardPath $Project) (($card | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     return $card
 }
 function Mark-RecoveryCardCompacted([string]$Project, $Event) {
     $card = Read-RecoveryCard $Project
     if ($null -eq $card) { return $false }
     $card.lastCompactedAt = [DateTime]::UtcNow.ToString('o'); $card.lastCompactedSessionId = [string](Get-Value $Event 'session_id')
-    $card | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Get-RecoveryCardPath $Project) -Encoding utf8
+    Write-Utf8Text (Get-RecoveryCardPath $Project) (($card | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     return $true
 }
 function Send-Context([string]$HookEventName, [string]$Context) {
     if ([string]::IsNullOrWhiteSpace($Context)) { return }
-    [ordered]@{ hookSpecificOutput = [ordered]@{ hookEventName = $HookEventName; additionalContext = $Context } } | ConvertTo-Json -Depth 8 -Compress
+    [Console]::Out.WriteLine(([ordered]@{ hookSpecificOutput = [ordered]@{ hookEventName = $HookEventName; additionalContext = $Context } } | ConvertTo-Json -Depth 8 -Compress))
 }
 
 try {

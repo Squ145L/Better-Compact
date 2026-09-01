@@ -16,6 +16,12 @@ function Assert-Utf8WithoutBom([string]$Path, [string]$Message) {
     $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
     Assert-True (-not $hasBom) $Message
 }
+function Write-Utf8NoBomText([string]$Path, [string]$Text) {
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+function Read-Utf8Json([string]$Path) {
+    return [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json
+}
 function Invoke-InstalledHook($Event) {
     $payload = $Event | ConvertTo-Json -Depth 10 -Compress
     $runtime = Join-Path $Workspace '.agents\skills\better-compact\runtime'
@@ -71,14 +77,15 @@ function Invoke-InteractiveInstaller([string]$TargetWorkspace = $Workspace, [swi
 
 try {
     New-Item -ItemType Directory -Force -Path (Join-Path $Workspace 'project-a'), (Join-Path $Workspace 'project-b'), (Join-Path $Workspace 'docs'), $TestHome | Out-Null
-    Set-Content -LiteralPath (Join-Path $Workspace 'AGENTS.md') -Value '# Root rule' -Encoding utf8
+    Write-Utf8NoBomText (Join-Path $Workspace 'AGENTS.md') '# 根规则'
     Set-Content -LiteralPath (Join-Path $Workspace 'README.md') -Value 'README-MUST-NOT-INJECT' -Encoding utf8
-    Set-Content -LiteralPath (Join-Path $Workspace 'project-a\AGENTS.md') -Value '# Project rule' -Encoding utf8
-    Set-Content -LiteralPath (Join-Path $Workspace 'project-a\TASK_STATE.md') -Value '# Project task state' -Encoding utf8
+    Write-Utf8NoBomText (Join-Path $Workspace 'project-a\AGENTS.md') '# 项目规则'
+    Write-Utf8NoBomText (Join-Path $Workspace 'project-a\TASK_STATE.md') '# 项目任务状态'
     $env:USERPROFILE = $TestHome
     $codexHome = Join-Path $TestHome '.codex'
     New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
-    [pscustomobject]@{ hooks = [pscustomobject]@{ SessionStart = @([pscustomobject]@{ matcher = '^startup$'; hooks = @([pscustomobject]@{ command = 'echo user-hook' }) }) } } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $codexHome 'hooks.json') -Encoding utf8
+    $existingHooks = [pscustomobject]@{ hooks = [pscustomobject]@{ SessionStart = @([pscustomobject]@{ matcher = '^startup$'; hooks = @([pscustomobject]@{ command = 'echo user-hook'; statusMessage = '用户钩子' }) }) } }
+    Write-Utf8NoBomText (Join-Path $codexHome 'hooks.json') ($existingHooks | ConvertTo-Json -Depth 10)
 
     & $Installer -WorkspaceRoot $Workspace -ExistingHooksAction Merge
     $toolRoot = Join-Path $Workspace '.agents\skills\better-compact'
@@ -86,13 +93,13 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $toolRoot 'SKILL.md')) 'installer should copy the workspace-local Skill'
     Assert-True (Test-Path -LiteralPath (Join-Path $runtime 'Uninstall.ps1')) 'installer should copy the workspace-local uninstaller'
     Assert-True ((Get-FileHash -LiteralPath (Join-Path $DistributionRoot 'prompts\task-state.md')).Hash -eq (Get-FileHash -LiteralPath (Join-Path $toolRoot 'prompts\task-state.md')).Hash) 'installer should copy the exact TASK_STATE management prompt'
-    $config = Get-Content -LiteralPath (Join-Path $toolRoot 'config\workspace.json') -Raw | ConvertFrom-Json
+    $config = Read-Utf8Json (Join-Path $toolRoot 'config\workspace.json')
     Assert-True ($config.coreEnabled -and $config.taskStateEnabled) 'fresh installation should default both switches to ON'
     Assert-Utf8WithoutBom (Join-Path $toolRoot 'config\workspace.json') 'installer must write workspace config without a UTF-8 BOM'
     Assert-Utf8WithoutBom (Join-Path $toolRoot 'install\install.json') 'installer must write installation metadata without a UTF-8 BOM'
     $status = Invoke-Controller Status | Out-String
     foreach ($field in @('Core:', 'TASK_STATE:', 'Workspace:', 'Tool directory:', 'Active project:', 'Recovery Card directory:')) { Assert-True ($status -match [regex]::Escape($field)) "status should include $field" }
-    $hooks = Get-Content -LiteralPath (Join-Path $codexHome 'hooks.json') -Raw | ConvertFrom-Json
+    $hooks = Read-Utf8Json (Join-Path $codexHome 'hooks.json')
     Assert-Utf8WithoutBom (Join-Path $codexHome 'hooks.json') 'installer must write hooks.json without a UTF-8 BOM'
     Assert-True ($null -eq $hooks.hooks.PSObject.Properties['PreToolUse']) 'installer must not register PreToolUse'
     foreach ($eventName in @('SessionStart', 'PostToolUse', 'PreCompact')) {
@@ -101,6 +108,7 @@ try {
     $sessionGroup = @($hooks.hooks.SessionStart | Where-Object { $_.hooks.command -match [regex]::Escape((Join-Path $runtime 'continuity.ps1')) })[0]
     Assert-True ($sessionGroup.matcher -eq '^(compact|resume)$') 'SessionStart matcher should exclude startup'
     Assert-True ($hooks.hooks.SessionStart[0].hooks.command -eq 'echo user-hook') 'installer must preserve existing user hooks'
+    Assert-True ($hooks.hooks.SessionStart[0].hooks.statusMessage -eq '用户钩子') 'installer must preserve UTF-8 Chinese content from existing hooks.json'
     Assert-True ((Get-ChildItem -LiteralPath $codexHome -Filter 'hooks.json.better-compact-backup-*.json').Count -eq 1) 'merging existing hooks must create a backup beside hooks.json'
 
     $base = @{ session_id = 'test-session'; cwd = $Workspace; tool_name = 'apply_patch' }
@@ -145,7 +153,9 @@ try {
     $output = (Invoke-InstalledHook $resume | Select-Object -Last 1) | ConvertFrom-Json
     $context = [string]$output.hookSpecificOutput.additionalContext
     Assert-True ($context -notmatch 'README-MUST-NOT-INJECT') 'README must not be reinjected'
-    $rootIndex = $context.IndexOf('# Root rule'); $projectIndex = $context.IndexOf('# Project rule'); $promptIndex = $context.IndexOf('TASK_STATE management prompt'); $stateIndex = $context.IndexOf('# Project task state'); $cardIndex = $context.IndexOf('Recovery Card: project-a')
+    $expectedPrompt = [System.IO.File]::ReadAllText((Join-Path $toolRoot 'prompts\task-state.md'), (New-Object System.Text.UTF8Encoding($false))).Trim()
+    Assert-True ($context.Contains($expectedPrompt)) 'Windows PowerShell hook must inject the exact UTF-8 TASK_STATE management prompt'
+    $rootIndex = $context.IndexOf('# 根规则'); $projectIndex = $context.IndexOf('# 项目规则'); $promptIndex = $context.IndexOf('TASK_STATE management prompt'); $stateIndex = $context.IndexOf('# 项目任务状态'); $cardIndex = $context.IndexOf('Recovery Card: project-a')
     Assert-True ($rootIndex -ge 0 -and $rootIndex -lt $projectIndex -and $projectIndex -lt $promptIndex -and $promptIndex -lt $stateIndex -and $stateIndex -lt $cardIndex) "resume injection order must be rules, prompt, TASK_STATE, recovery card (indices: $rootIndex, $projectIndex, $promptIndex, $stateIndex, $cardIndex)"
     $startup = @{ hook_event_name = 'SessionStart'; session_id = 'test-session'; cwd = $Workspace; source = 'startup' }
     Assert-True ((Invoke-InstalledHook $startup).Count -eq 0) 'startup must not inject context'
@@ -202,8 +212,9 @@ try {
 
     & (Join-Path $runtime 'Uninstall.ps1')
     Assert-True (-not (Test-Path -LiteralPath $toolRoot)) 'uninstaller should remove only the workspace-local Better Compact directory'
-    $hooks = Get-Content -LiteralPath (Join-Path $codexHome 'hooks.json') -Raw | ConvertFrom-Json
+    $hooks = Read-Utf8Json (Join-Path $codexHome 'hooks.json')
     Assert-True ($hooks.hooks.SessionStart[0].hooks.command -eq 'echo user-hook') 'uninstaller must preserve user hooks'
+    Assert-True ($hooks.hooks.SessionStart[0].hooks.statusMessage -eq '用户钩子') 'uninstaller must preserve UTF-8 Chinese content from existing hooks.json'
     Assert-True ($null -eq $hooks.hooks.PSObject.Properties['PreToolUse']) 'uninstaller must not add or retain a Better Compact PreToolUse hook'
     Write-Host 'PASS: installation, switches, three-hook lifecycle, recovery injection, upgrade safety, and workspace-local uninstall.' -ForegroundColor Green
 } finally {

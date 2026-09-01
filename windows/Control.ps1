@@ -15,6 +15,10 @@ $ConfigDirectory = Join-Path $ToolRoot 'config'
 $ConfigPath = Join-Path $ConfigDirectory 'workspace.json'
 $RecoveryDirectory = Join-Path $ToolRoot 'recovery'
 $ActivePath = Join-Path $RecoveryDirectory 'active-projects.json'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Read-Utf8Text([string]$Path) { return [System.IO.File]::ReadAllText($Path, $Utf8NoBom) }
+function Write-Utf8Text([string]$Path, [string]$Text) { [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom) }
 
 function Get-Value($Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -31,7 +35,7 @@ function Get-DefaultConfig {
 function Read-Config {
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return Get-DefaultConfig }
     try {
-        $parsed = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        $parsed = Read-Utf8Text $ConfigPath | ConvertFrom-Json
         if ($null -eq $parsed) { return Get-DefaultConfig }
         return [pscustomobject]@{
             schemaVersion = 1
@@ -45,7 +49,7 @@ function Write-Config($Config) {
     New-Item -ItemType Directory -Force -Path $ConfigDirectory | Out-Null
     $temporary = Join-Path $ConfigDirectory ('.workspace-' + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        $Config | ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding utf8
+        Write-Utf8Text $temporary (($Config | ConvertTo-Json) + [Environment]::NewLine)
         Move-Item -LiteralPath $temporary -Destination $ConfigPath -Force
     } finally {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
@@ -59,7 +63,7 @@ function Get-PathKey([string]$Path) {
 function Get-ActiveProject {
     if (-not (Test-Path -LiteralPath $ActivePath -PathType Leaf)) { return '-' }
     try {
-        $active = Get-Content -LiteralPath $ActivePath -Raw | ConvertFrom-Json
+        $active = Read-Utf8Text $ActivePath | ConvertFrom-Json
         $property = $active.PSObject.Properties[(Get-PathKey $WorkspaceRoot)]
         if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) { return '-' }
         return [string]$property.Value
