@@ -9,6 +9,10 @@ Better Compact 在 Codex 压缩上下文或恢复会话后，自动补回必要�
 
 ### 方式一：手动安装
 
+双击 `Install.cmd`
+
+或者
+
 在工作区根目录运行，把路径改成你要使用的 workspace：
 
 ```powershell
@@ -32,7 +36,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 flowchart LR
     A[成功编辑] --> B[记一张恢复卡]
     B --> C[compact 或 resume]
-    C --> D[补回必要上下文]
+    C --> D[注入AGENTS.md 和 task_state.md]
 ```
 
 | 时机 | 做什么 |

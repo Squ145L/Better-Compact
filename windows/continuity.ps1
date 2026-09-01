@@ -74,7 +74,10 @@ function Get-ActiveProject([string]$Cwd) {
 }
 function Get-ProjectNameForPath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-    try { $fullPath = [System.IO.Path]::GetFullPath((Join-Path $WorkspaceRoot $Path)) } catch { return $null }
+    try {
+        $candidate = if ([System.IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path $WorkspaceRoot $Path }
+        $fullPath = [System.IO.Path]::GetFullPath($candidate)
+    } catch { return $null }
     $prefix = $WorkspaceRoot + [char]92
     if (-not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
     $relative = $fullPath.Substring($prefix.Length)
@@ -152,7 +155,11 @@ function Send-Context([string]$HookEventName, [string]$Context) {
 
 try {
     $rawEvent = [Console]::In.ReadToEnd(); if ([string]::IsNullOrWhiteSpace($rawEvent)) { exit 0 }
-    $event = $rawEvent | ConvertFrom-Json; $stage = [string](Get-Value $event 'hook_event_name'); $cwd = [string](Get-Value $event 'cwd')
+    try { $event = $rawEvent | ConvertFrom-Json } catch {
+        Write-Diagnostic 'Dispatch' 'failed' '-' "reason=invalid-hook-json; inputLength=$($rawEvent.Length)" $null
+        exit 0
+    }
+    $stage = [string](Get-Value $event 'hook_event_name'); $cwd = [string](Get-Value $event 'cwd')
     if ([string]::IsNullOrWhiteSpace($cwd)) { $cwd = $WorkspaceRoot }
     switch ($stage) {
         'PostToolUse' {
@@ -187,6 +194,7 @@ try {
         default { Write-Diagnostic $stage 'ignored' '-' 'reason=unsupported-event' $event }
     }
 } catch {
-    try { Write-Diagnostic 'Dispatch' 'failed' '-' $_.Exception.Message $null } catch { [Console]::Error.WriteLine("[better-compact] Dispatch/failed: $($_.Exception.Message)") }
-    exit 1
+    $inputLength = if ($null -eq $rawEvent) { 0 } else { $rawEvent.Length }
+    try { Write-Diagnostic 'Dispatch' 'failed' '-' "reason=dispatch-failed; exception=$($_.Exception.GetType().Name); inputLength=$inputLength" $null } catch { [Console]::Error.WriteLine("[better-compact] Dispatch/failed: $($_.Exception.GetType().Name)") }
+    exit 0
 }
