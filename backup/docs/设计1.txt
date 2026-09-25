@@ -1,0 +1,786 @@
+Better Compact：可插拔开关与 TASK_STATE 管理需求
+
+1. 背景
+
+Better Compact 当前主要解决 Codex 在长时间开发过程中经历 compact / resume / reopen 后的上下文连续性问题。
+
+现有核心能力包括：
+
+重新恢复项目规则。
+
+记录最近实际成功修改过的文件。
+
+识别当前活动子项目。
+
+在 compact 前记录恢复节点。
+
+compact / resume / reopen 后注入必要的恢复信息。
+
+不保存完整聊天、用户消息、原始 patch 或完整 transcript。
+
+目前新的需求不是继续增加“记忆量”，而是解决两个问题：
+
+Better Compact 应该可以按 workspace 开启或关闭，而不是安装后始终工作。
+
+对于长任务，仅靠 recovery card 无法恢复“当前到底在做什么”，因此需要一个可选的 TASK_STATE.md 机制。
+
+2. 核心目的
+
+Better Compact 应继续保持：
+
+最小、可审计、低侵入、可关闭。
+
+不要把它发展成自动保存完整上下文的 Memory 系统。
+
+整个连续性机制分成三个职责明确的层：
+
+AGENTS.md
+    ↓
+项目长期规则 / 规范入口
+
+TASK_STATE.md
+    ↓
+当前任务的语义状态
+
+Better Compact Recovery
+    ↓
+Hook 自动记录的可验证工程事实
+
+三者不要互相替代。
+
+3. 为什么需要 TASK_STATE
+
+Recovery Card 能可靠回答：
+
+刚才修改了哪些文件？
+最后成功修改发生在什么时候？
+当前工作的是哪个项目？
+什么时候发生了 compact？
+
+但它无法可靠回答：
+
+为什么修改这些文件？
+当前最终目标是什么？
+哪些设计已经确认？
+哪些方案已经明确排除？
+现在做到哪个阶段？
+下一步应该做什么？
+
+这些信息属于任务语义，而不是可以由 Hook 从 apply_patch 结果直接推导出的工程事实。
+
+因此需要 TASK_STATE.md。
+
+4. TASK_STATE 的定位
+
+TASK_STATE.md 不是聊天记录，也不是完整项目文档。
+
+它只保存当前长期任务继续执行所必需的高密度状态。
+
+建议包含：
+
+目标
+
+已确认边界
+
+已排除项
+
+当前状态
+
+下一步
+
+例如：
+
+# TASK_STATE
+
+## 目标
+
+按照设计文档完成前端模块化重构。
+
+## 已确认边界
+
+- 不改变现有 API。
+- 页面业务逻辑必须隔离。
+- 页面之间通过规定的事件层通信。
+
+## 已排除
+
+- 不把多个页面逻辑合并到 app.js。
+- 不在本阶段重写后端。
+
+## 当前状态
+
+Phase 2：正在迁移 settings 页面。
+
+已完成：
+
+- core 拆分
+- events 层
+- settings 基础结构
+
+## 下一步
+
+迁移 settings 页面事件处理，然后运行相关测试。
+
+目标是：
+
+compact 后不用恢复大量历史聊天，也能快速知道任务进行到了哪里。
+
+5. TASK_STATE 的维护责任
+
+必须明确区分自动事实和语义状态。
+
+Recovery
+
+由 Better Compact Hook 自动维护。
+
+例如：
+
+recovery.json
+active-projects.json
+compact_time
+最近成功修改文件
+
+这些信息来源于可验证的工具执行结果。
+
+TASK_STATE
+
+由 Codex 维护。
+
+Better Compact Hook：
+
+不要自动总结或重写 TASK_STATE.md 的语义内容。
+
+原因：
+
+Hook 可以知道：
+
+A.js 被成功修改
+
+但不能可靠知道：
+
+为什么修改 A.js
+这个修改完成了计划中的哪一步
+用户刚刚确认了什么设计
+下一步应该是什么
+
+因此：
+
+Hook
+→ 管工程事实
+
+Codex
+→ 管任务语义
+
+用户
+→ 决定是否启用以及最终控制权
+
+6. TASK_STATE 的更新原则
+
+当 TASK_STATE 功能启用时：
+
+创建
+
+如果当前任务属于：
+
+长期任务；
+
+多阶段任务；
+
+可能经历 compact 的任务；
+
+需要后续继续或交接的任务；
+
+并且当前不存在有效 TASK_STATE.md，Codex 应创建它。
+
+更新
+
+不要每修改一个文件就更新 TASK_STATE。
+
+只在出现关键状态变化时更新，例如：
+
+完成一个 Phase
+
+目标发生变化
+
+用户确认新的重要边界
+
+某个方案被明确排除
+
+当前阶段发生变化
+
+下一步发生变化
+
+准备进入可能影响连续性的节点
+
+这样避免 TASK_STATE 自身产生大量无意义写入和上下文开销。
+
+读取
+
+继续长期任务以及 compact / resume / reopen 后，应优先使用 TASK_STATE 恢复任务状态。
+
+但 TASK_STATE 不是绝对事实。
+
+如果：
+
+TASK_STATE
+        ↓
+与实际代码 / Git / 测试结果 / 文件状态冲突
+
+则：
+
+可验证工程事实优先
+        ↓
+修正 TASK_STATE
+
+7. TASK_STATE 文件位置
+
+建议放在当前项目根目录：
+
+<project>/TASK_STATE.md
+
+而不是 Better Compact 内部状态目录。
+
+例如：
+
+workspace/
+├─ project-a/
+│  ├─ AGENTS.md
+│  ├─ TASK_STATE.md
+│  └─ src/
+│
+└─ project-b/
+   ├─ AGENTS.md
+   └─ src/
+
+原因：
+
+TASK_STATE 属于项目语义状态，而不是 Better Compact 内部数据库。
+
+用户应该能够：
+
+直接阅读；
+
+手动修改；
+
+决定是否加入 Git；
+
+决定是否加入 .gitignore；
+
+即使以后不用 Better Compact，也仍然能够理解这个文件。
+
+8. Better Compact 开关设计
+
+Better Compact 不应该通过安装/卸载 Hook 来完成日常开关。
+
+Hook 可以保持注册。
+
+每次 Hook 执行时首先检查 Better Compact 配置：
+
+Hook 触发
+    ↓
+读取配置
+    ↓
+当前 workspace enabled?
+    ↓
+否 → 立即退出
+是 → 正常执行
+
+这样可以避免频繁修改用户的 hooks.json。
+
+9. 开关作用域
+
+Better Compact 应至少区分：
+
+是否已安装
+
+全局是否允许运行
+
+当前 workspace 是否启用
+
+其中日常 /better-compact on/off 建议默认控制当前 workspace。
+
+例如：
+
+/better-compact on
+/better-compact off
+/better-compact status
+
+语义：
+
+on
+→ 当前 workspace 启用 Better Compact
+
+off
+→ 当前 workspace 停止 Better Compact
+
+status
+→ 显示当前 workspace 的 Better Compact 状态
+
+关闭不等于卸载。
+
+10. TASK_STATE 独立开关
+
+TASK_STATE 不应该和 Better Compact Core 强制绑定。
+
+建议至少支持：
+
+/better-compact task-state on
+
+/better-compact task-state off
+
+/better-compact task-state clear
+
+/better-compact status
+
+语义：
+
+task-state on
+
+当前 workspace 启用 TASK_STATE 工作流。
+
+之后长期任务可以创建和维护 TASK_STATE.md。
+
+task-state off
+
+停止自动使用 TASK_STATE 工作流。
+
+不要删除已有 TASK_STATE.md。
+
+关闭功能和删除数据必须分开。
+
+task-state clear
+
+清理当前项目的 TASK_STATE。
+
+因为涉及删除用户可见文件，应当安全处理；不要因为 off 自动删除。
+
+status
+
+建议至少显示：
+
+Better Compact: ON
+
+Workspace:
+D:\xxx
+
+Recovery:
+ON
+
+TASK_STATE:
+ON
+
+TASK_STATE file:
+project-a/TASK_STATE.md
+
+具体格式可以根据现有实现调整。
+
+11. 配置管理
+
+开关状态不要依赖：
+
+AGENTS.md 是否存在某段文字
+
+也不要依赖：
+
+Skill 是否安装
+
+应该存在独立、机器可读取的配置状态。
+
+例如概念上：
+
+{
+  "enabled": true,
+  "task_state": "on"
+}
+
+具体配置文件位置、格式以及 workspace 映射方式，请结合现有 Better Compact 的 install.json、workspace hash 和 state 结构决定，不要求照搬此示例。
+
+重点是：
+
+Skill / 命令只是控制入口，配置文件才是真实状态源。
+
+12. Skill / Command 的职责
+
+希望最终可以使用类似：
+
+/better-compact on
+/better-compact off
+/better-compact status
+
+/better-compact task-state on
+/better-compact task-state off
+/better-compact task-state clear
+
+但不要把 Better Compact 的核心实现绑死在 Skill 上。
+
+推荐职责：
+
+用户命令
+     ↓
+Skill / Command Adapter
+     ↓
+调用 Better Compact 控制逻辑
+     ↓
+修改配置
+     ↓
+Hooks 根据配置决定行为
+
+也就是说：
+
+Skill
+=
+用户交互入口
+
+PowerShell / Better Compact Core
+=
+实际实现
+
+配置文件
+=
+状态源
+
+这样未来即使：
+
+Codex Skill 机制变化；
+
+增加 CLI；
+
+增加 GUI；
+
+增加其他 Agent 适配；
+
+Better Compact Core 也不需要重写。
+
+13. AGENTS.md 与详细规范
+
+另一个需要解决的问题是上下文成本。
+
+不要把完整开发规范全部塞入 AGENTS.md。
+
+建议：
+
+AGENTS.md
+        ↓
+只保存关键规则 + 规范索引
+
+docs/rules/
+        ↓
+保存详细规范
+
+例如：
+
+# Project Rules
+
+## Critical
+
+- 不同页面业务逻辑必须隔离。
+- 禁止为了快速实现功能把多个页面逻辑合并到同一文件。
+- 跨模块通信遵循项目事件层。
+
+## Rule Index
+
+前端规范：
+docs/rules/frontend.md
+
+架构规范：
+docs/rules/architecture.md
+
+后端规范：
+docs/rules/backend.md
+
+Codex 根据当前任务按需读取对应详细规范。
+
+目标不是每次 compact 后重新加载全部规范，而是：
+
+compact
+   ↓
+恢复少量关键规则
+   ↓
+恢复 TASK_STATE
+   ↓
+恢复 Recovery Card
+   ↓
+根据当前任务按需读取详细规范
+
+从而降低上下文恢复成本。
+
+14. AGENTS.md 中 TASK_STATE 规则
+
+安装/配置过程中，不要未经用户允许直接修改现有 AGENTS.md。
+
+如果用户选择启用 TASK_STATE，可以建议加入类似规则：
+
+- 对长期、需交接或可能经历 compact 的任务，使用 `TASK_STATE.md` 记录目标、已确认边界、已排除项、当前状态和下一步。
+- 关键状态变化后更新，后续继续任务前先读取该文件，作为防止 compact 丢失任务状态的持久状态源；若与可验证事实冲突，以可验证事实为准，并及时修正 `TASK_STATE.md`。
+- 不在其中记录密钥、令牌、密码或隐私信息。
+
+如果 Better Compact 已经有更合适的方式动态提供这条规则，也可以重新设计。
+
+重点是：
+
+不要为了开关 TASK_STATE 而频繁修改 AGENTS.md。
+
+15. compact 时的职责
+
+当 Better Compact Core 开启：
+
+PreCompact
+    ↓
+记录 compact 时间等 Recovery 信息
+
+当 TASK_STATE 开启：
+
+Codex 应确保关键任务状态已经写入 TASK_STATE。
+
+但 PowerShell Hook 不要自行生成任务语义总结。
+
+compact 后恢复：
+
+SessionStart / compact resume
+        ↓
+恢复项目规则
+        ↓
+检查 Better Compact 配置
+        ↓
+恢复 Recovery Card
+        ↓
+如果 TASK_STATE 开启且文件存在
+        ↓
+读取 TASK_STATE
+        ↓
+继续任务
+
+最终恢复的信息层应该是：
+
+AGENTS.md
+    ↓
+“我应该遵守什么规则？”
+
+TASK_STATE.md
+    ↓
+“我正在做什么、做到哪里？”
+
+Recovery Card
+    ↓
+“刚才实际上改了什么？”
+
+16. 需要修改/新增的部分
+
+请先检查当前 Better Compact 实现，再决定具体文件，不要为了符合本文档而进行不必要的重构。
+
+预计需要涉及以下几个逻辑区域：
+
+Better Compact Core
+
+增加：
+
+workspace enabled 状态读取；
+
+TASK_STATE enabled 状态读取；
+
+状态查询；
+
+开关写入；
+
+disabled 时 Hook 快速退出。
+
+Hooks
+
+检查：
+
+SessionStart
+
+PreToolUse
+
+PostToolUse
+
+PreCompact
+
+让它们尊重 workspace 开关。
+
+不要破坏现有：
+
+successful edit tracking；
+
+failed edit exclusion；
+
+shared docs exclusion；
+
+active project；
+
+recovery card；
+
+compact recovery。
+
+TASK_STATE
+
+增加：
+
+on/off 状态；
+
+文件检测；
+
+compact/resume 时的使用规则；
+
+clear 行为。
+
+不要让 Hook 自动编写任务语义。
+
+Skill / 命令入口
+
+如果当前 Codex 能通过 Skill 或其他合适机制实现 /better-compact，优先把它作为用户入口。
+
+但先确认当前 Codex 实际支持的机制，不要假设不存在的 API。
+
+Installer
+
+安装阶段需要：
+
+安装 Core；
+
+注册 Hook；
+
+初始化配置；
+
+不强制开启 TASK_STATE；
+
+如果需要修改已有配置，继续遵循当前 merge-or-cancel 安全原则。
+
+README
+
+重新整理安装说明：
+
+确认 workspace。
+
+安装 Better Compact。
+
+引导用户信任 Hook。
+
+说明 /better-compact on/off/status。
+
+询问是否启用 TASK_STATE。
+
+如果启用，指导配置 AGENTS.md。
+
+明确 Core 和 TASK_STATE 的区别。
+
+17. 不要做的事情
+
+本次改动不要：
+
+保存完整聊天记录；
+
+保存用户 prompt 历史；
+
+保存完整 transcript；
+
+自动保存原始 patch；
+
+把 TASK_STATE 变成自动 Memory；
+
+Hook 自行猜测用户目标；
+
+每次修改文件都重写 TASK_STATE；
+
+off 时删除 TASK_STATE；
+
+通过反复增删 hooks.json 实现日常开关；
+
+自动绕过 Codex Hook 信任机制；
+
+为实现开关而大规模重构已经稳定工作的 Recovery Core。
+
+18. 实现优先级
+
+优先保持简单。
+
+第一阶段只需要可靠实现：
+
+Better Compact workspace on/off/status
+
+TASK_STATE on/off/clear
+
+配置持久化
+
+Hooks 尊重开关
+
+TASK_STATE 与 Recovery 职责分离
+
+不要第一版就加入复杂的：
+
+多 Profile
+自动规则推理
+自动任务分类
+完整 Session Memory
+复杂 GUI
+规则依赖图
+自动总结全部聊天
+
+如果 Codex 当前 Skill / Slash Command 能力不足以优雅实现 /better-compact，不要硬做。
+
+先保留 Core 的命令行/PowerShell 控制接口，再选择当前 Codex 最稳定的交互入口。
+
+19. 验收标准
+
+完成后至少验证：
+
+Better Compact 开启时，现有 Recovery 功能正常。
+
+Better Compact 关闭时，Hook 不再记录或注入 Recovery。
+
+重新开启后，无需重新安装 Hook。
+
+一个 workspace 关闭不会错误影响其他 workspace。
+
+TASK_STATE on 后能够在长期任务中正常使用。
+
+TASK_STATE off 后不再主动使用，但已有文件不会被删除。
+
+TASK_STATE clear 能安全清理当前项目状态。
+
+Hook 不会自行生成或修改任务语义。
+
+compact 后可以通过：
+
+AGENTS
+
+TASK_STATE
+
+Recovery Card
+恢复继续任务所需的主要信息。
+
+原有 failed-edit exclusion、shared-doc exclusion、active-project tracking 等测试不能回归。
+
+安装、关闭、重新开启、卸载都不能破坏用户原有 hooks 配置。
+
+20. 实现前要求
+
+不要收到本文档后直接大规模修改代码。
+
+先：
+
+阅读现有 Better Compact 项目结构和 README。
+
+阅读现有 Hook / installer / state 实现。
+
+确认 Codex 当前实际可用的 Skill / Slash Command / Hook 能力。
+
+给出准备修改的文件和职责。
+
+判断本文档中哪些设计可以直接实现，哪些需要根据 Codex 当前机制调整。
+
+保持现有已验证功能不变的前提下，再逐步实现。
+
+设计优先级：
+
+可靠
+ >
+简单
+ >
+可审计
+ >
+低上下文成本
+ >
+功能数量
+
+不要为了“功能完整”破坏 Better Compact 原本轻量、透明的设计。

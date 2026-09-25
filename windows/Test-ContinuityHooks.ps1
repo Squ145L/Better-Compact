@@ -1,0 +1,288 @@
+﻿[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$DistributionRoot = Split-Path -Parent $PSScriptRoot
+$Installer = Join-Path $PSScriptRoot 'Install.ps1'
+$Launcher = Join-Path $DistributionRoot 'Install.cmd'
+$MigrationUninstaller = Join-Path $PSScriptRoot 'Uninstall-All.ps1'
+$UninstallLauncher = Join-Path $DistributionRoot 'Uninstall.cmd'
+$TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('better-compact-test-' + [guid]::NewGuid().ToString('N'))
+$Workspace = Join-Path $TestRoot 'workspace'
+$TestHome = Join-Path $TestRoot 'home'
+$OriginalUserProfile = $env:USERPROFILE
+
+function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "ASSERTION FAILED: $Message" } }
+function Assert-Utf8WithoutBom([string]$Path, [string]$Message) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    Assert-True (-not $hasBom) $Message
+}
+function Write-Utf8NoBomText([string]$Path, [string]$Text) {
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+function Read-Utf8Json([string]$Path) {
+    return [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json
+}
+function Invoke-InstalledHook($Event) {
+    $payload = $Event | ConvertTo-Json -Depth 10 -Compress
+    $runtime = Join-Path $Workspace '.agents\skills\better-compact\runtime'
+    $hook = Join-Path $runtime 'continuity.ps1'
+    $toolRoot = Split-Path -Parent $runtime
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = $payload | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook -WorkspaceRoot $Workspace -ToolRoot $toolRoot 2>&1
+    } finally { $ErrorActionPreference = $previousErrorActionPreference }
+    return @($lines | Where-Object { $_ -match '^\{' })
+}
+function Invoke-InstalledHookRaw([string]$Payload) {
+    $runtime = Join-Path $Workspace '.agents\skills\better-compact\runtime'
+    $hook = Join-Path $runtime 'continuity.ps1'
+    $toolRoot = Split-Path -Parent $runtime
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        return @($Payload | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook -WorkspaceRoot $Workspace -ToolRoot $toolRoot 2>&1)
+    } finally { $ErrorActionPreference = $previousErrorActionPreference }
+}
+function Invoke-Controller([string]$Action, [bool]$Enabled = $true) {
+    $controller = Join-Path $Workspace '.agents\skills\better-compact\runtime\Control.ps1'
+    return @(& $controller -Action $Action -Enabled $Enabled 2>&1)
+}
+function Invoke-InteractiveInstaller([string]$TargetWorkspace = $Workspace, [string]$HookAnswer = 'M', [switch]$UseLauncher) {
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    if ($UseLauncher) {
+        $processInfo.FileName = 'cmd.exe'
+        $processInfo.Arguments = "/d /c `"`"$Launcher`"`""
+    } else {
+        $processInfo.FileName = 'powershell.exe'
+        $processInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Installer`""
+    }
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardInput = $true
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $true
+    $processInfo.EnvironmentVariables['USERPROFILE'] = $TestHome
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+    [void]$process.Start()
+    $process.StandardInput.WriteLine($TargetWorkspace)
+    $process.StandardInput.WriteLine($HookAnswer)
+    $process.StandardInput.WriteLine('')
+    $process.StandardInput.Close()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    return [pscustomobject]@{ exitCode = $process.ExitCode; output = $stdout + $stderr }
+}
+
+try {
+    New-Item -ItemType Directory -Force -Path (Join-Path $Workspace 'project-a'), (Join-Path $Workspace 'project-b'), (Join-Path $Workspace 'docs'), $TestHome | Out-Null
+    Write-Utf8NoBomText (Join-Path $Workspace 'AGENTS.md') '# 根规则'
+    Set-Content -LiteralPath (Join-Path $Workspace 'README.md') -Value 'README-MUST-NOT-INJECT' -Encoding utf8
+    Write-Utf8NoBomText (Join-Path $Workspace 'project-a\AGENTS.md') '# 项目规则'
+    Write-Utf8NoBomText (Join-Path $Workspace 'project-a\TASK_STATE.md') '# 项目任务状态'
+    $env:USERPROFILE = $TestHome
+    $codexHome = Join-Path $TestHome '.codex'
+    New-Item -ItemType Directory -Force -Path $codexHome | Out-Null
+    $existingHooks = [pscustomobject]@{ hooks = [pscustomobject]@{ SessionStart = @([pscustomobject]@{ matcher = '^startup$'; hooks = @([pscustomobject]@{ command = 'echo user-hook'; statusMessage = '用户钩子' }) }) } }
+    Write-Utf8NoBomText (Join-Path $codexHome 'hooks.json') ($existingHooks | ConvertTo-Json -Depth 10)
+
+    $globalSkillRoot = Join-Path $TestHome '.agents\skills\better-compact'
+    $initialHooksHash = (Get-FileHash -LiteralPath (Join-Path $codexHome 'hooks.json')).Hash
+    $emptyPathInstall = Invoke-InteractiveInstaller -TargetWorkspace ''
+    Assert-True ($emptyPathInstall.exitCode -eq 0 -and -not (Test-Path -LiteralPath $globalSkillRoot)) 'empty path should cancel before installing the global Skill'
+    $cancelledInstall = Invoke-InteractiveInstaller -HookAnswer 'C'
+    Assert-True ($cancelledInstall.exitCode -eq 0 -and -not (Test-Path -LiteralPath $globalSkillRoot)) 'Hook merge cancellation should not install the global Skill'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $Workspace '.agents\skills\better-compact'))) 'cancelled installation should not create workspace files'
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $codexHome 'hooks.json')).Hash -eq $initialHooksHash) 'cancelled installation should preserve existing hooks.json'
+    & $Installer -WorkspaceRoot $Workspace -ExistingHooksAction Merge
+    $toolRoot = Join-Path $Workspace '.agents\skills\better-compact'
+    $runtime = Join-Path $toolRoot 'runtime'
+    $globalPackageRoot = Join-Path $globalSkillRoot 'package'
+    Assert-True (Test-Path -LiteralPath (Join-Path $globalSkillRoot 'SKILL.md')) 'installer should register the one global Better Compact Skill'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $toolRoot 'SKILL.md'))) 'workspace installation must not create a duplicate local Better Compact Skill'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $globalPackageRoot 'skill\SKILL.md'))) 'global package must not contain a nested duplicate Skill'
+    Assert-True (Test-Path -LiteralPath (Join-Path $runtime 'Uninstall.ps1')) 'installer should copy the workspace-local uninstaller'
+    Assert-True (Test-Path -LiteralPath (Join-Path $globalPackageRoot 'windows\Install.ps1')) 'global Skill package should include its installer'
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $DistributionRoot 'skill\SKILL.md')).Hash -eq (Get-FileHash -LiteralPath (Join-Path $globalSkillRoot 'SKILL.md')).Hash) 'installer should copy the exact global Better Compact Skill'
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $DistributionRoot 'prompts\task-state.md')).Hash -eq (Get-FileHash -LiteralPath (Join-Path $toolRoot 'prompts\task-state.md')).Hash) 'installer should copy the exact TASK_STATE management prompt'
+    $skillText = Get-Content -LiteralPath (Join-Path $globalSkillRoot 'SKILL.md') -Raw
+    $promptText = Get-Content -LiteralPath (Join-Path $toolRoot 'prompts\task-state.md') -Raw
+    Assert-True ($skillText -match 'multi-file or multi-stage tasks' -and $skillText -match '答复前不安装' -and $skillText -match '不在末尾追加历史') 'Skill must select durable work, defer ambiguous projects, and rewrite state without appending history'
+    Assert-True ($promptText -match '已为当前任务选定唯一项目' -and $promptText -match '不要仅因本提示被注入就创建' -and $promptText -match '不追加历史') 'TASK_STATE prompt must require a selected project and concise replacement'
+    $config = Read-Utf8Json (Join-Path $toolRoot 'config\workspace.json')
+    Assert-True ($config.coreEnabled -and $config.taskStateEnabled) 'fresh installation should default both switches to ON'
+    Assert-Utf8WithoutBom (Join-Path $toolRoot 'config\workspace.json') 'installer must write workspace config without a UTF-8 BOM'
+    Assert-Utf8WithoutBom (Join-Path $toolRoot 'install\install.json') 'installer must write installation metadata without a UTF-8 BOM'
+
+    $secondWorkspace = Join-Path $TestRoot 'second-workspace'
+    New-Item -ItemType Directory -Force -Path $secondWorkspace | Out-Null
+    & (Join-Path $globalPackageRoot 'windows\Install.ps1') -WorkspaceRoot $secondWorkspace -ExistingHooksAction Merge
+    Assert-True (Test-Path -LiteralPath (Join-Path $secondWorkspace '.agents\skills\better-compact\runtime\continuity.ps1')) 'the global Skill package should install Better Compact into another workspace'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $secondWorkspace '.agents\skills\better-compact\SKILL.md'))) 'global package installation must not recreate a local duplicate Skill'
+    $status = Invoke-Controller Status | Out-String
+    foreach ($field in @('Core:', 'TASK_STATE:', 'Workspace:', 'Tool directory:', 'Active project:', 'Recovery Card directory:')) { Assert-True ($status -match [regex]::Escape($field)) "status should include $field" }
+    $hooks = Read-Utf8Json (Join-Path $codexHome 'hooks.json')
+    Assert-Utf8WithoutBom (Join-Path $codexHome 'hooks.json') 'installer must write hooks.json without a UTF-8 BOM'
+    Assert-True ($null -eq $hooks.hooks.PSObject.Properties['PreToolUse']) 'installer must not register PreToolUse'
+    foreach ($eventName in @('SessionStart', 'PostToolUse', 'PreCompact')) {
+        Assert-True ($null -ne $hooks.hooks.PSObject.Properties[$eventName]) "installer should register $eventName"
+    }
+    $sessionGroup = @($hooks.hooks.SessionStart | Where-Object { $_.hooks.command -match [regex]::Escape((Join-Path $runtime 'continuity.ps1')) })[0]
+    Assert-True ($sessionGroup.matcher -eq '^(compact|resume)$') 'SessionStart matcher should exclude startup'
+    Assert-True ($hooks.hooks.SessionStart[0].hooks.command -eq 'echo user-hook') 'installer must preserve existing user hooks'
+    Assert-True ($hooks.hooks.SessionStart[0].hooks.statusMessage -eq '用户钩子') 'installer must preserve UTF-8 Chinese content from existing hooks.json'
+    Assert-True ((Get-ChildItem -LiteralPath $codexHome -Filter 'hooks.json.better-compact-backup-*.json').Count -ge 1) 'merging existing hooks must create a backup beside hooks.json'
+
+    $base = @{ session_id = 'test-session'; cwd = $Workspace; tool_name = 'apply_patch' }
+    $post = $base.Clone(); $post.hook_event_name = 'PostToolUse'; $post.tool_input = @{ command = "*** Add File: project-a\probe.txt`n+ok" }; $post.tool_response = @{ success = $true }
+    Invoke-InstalledHook $post | Out-Null
+    $cardPath = Join-Path $toolRoot 'recovery\project-a.json'
+    Assert-True (Test-Path -LiteralPath $cardPath) 'successful edit should write a recovery card'
+    $successWithoutFlag = $base.Clone(); $successWithoutFlag.hook_event_name = 'PostToolUse'; $successWithoutFlag.tool_input = @{ command = "*** Add File: project-a\response-without-success.txt`n+x" }; $successWithoutFlag.tool_response = @{}
+    Invoke-InstalledHook $successWithoutFlag | Out-Null
+    $card = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
+    Assert-True ($card.files -contains 'response-without-success.txt') 'successful tool responses without a success field should be recorded as project-relative paths'
+    $slashVariant = $base.Clone(); $slashVariant.hook_event_name = 'PostToolUse'; $slashVariant.tool_input = @{ command = "*** Update File: project-a/probe.txt`n+same-file" }; $slashVariant.tool_response = @{ success = $true }
+    Invoke-InstalledHook $slashVariant | Out-Null
+    $card = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
+    Assert-True ((@($card.files | Where-Object { $_ -eq 'probe.txt' })).Count -eq 1) 'slash variants of one file must be deduplicated'
+    Assert-True ((@($card.files | Where-Object { $_ -match [regex]::Escape($Workspace) })).Count -eq 0) 'recovery cards must not retain absolute workspace paths'
+    $absolute = $base.Clone(); $absolute.hook_event_name = 'PostToolUse'; $absolute.tool_input = @{ command = "*** Add File: $(Join-Path $Workspace 'project-b\absolute-path.txt')`n+ok" }; $absolute.tool_response = @{ success = $true }
+    Invoke-InstalledHook $absolute | Out-Null
+    $absoluteCardPath = Join-Path $toolRoot 'recovery\project-b.json'
+    Assert-True (Test-Path -LiteralPath $absoluteCardPath) 'absolute project paths should write a recovery card'
+    $absoluteCard = Get-Content -LiteralPath $absoluteCardPath -Raw | ConvertFrom-Json
+    Assert-True ($absoluteCard.files -contains 'absolute-path.txt') 'absolute project paths should be stored relative to their project'
+    $legacyFiles = @(
+        (Join-Path $Workspace 'project-b\absolute-path.txt'),
+        ((Join-Path $Workspace 'project-b\absolute-path.txt').Replace('\', '/'))
+    ) + @(1..13 | ForEach-Object { Join-Path $Workspace "project-b\legacy-$_.txt" })
+    $legacyCard = [ordered]@{ schemaVersion = 1; project = 'project-b'; lastSuccessfulEditAt = '2026-01-01T00:00:00Z'; lastSuccessfulEditSessionId = 'legacy'; lastCompactedAt = $null; lastCompactedSessionId = $null; files = $legacyFiles }
+    Write-Utf8NoBomText $absoluteCardPath (($legacyCard | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+    $absoluteResume = @{ hook_event_name = 'SessionStart'; session_id = 'test-session'; cwd = $Workspace; source = 'compact' }
+    $absoluteOutput = (Invoke-InstalledHook $absoluteResume | Select-Object -Last 1) | ConvertFrom-Json
+    Assert-True ($absoluteOutput.hookSpecificOutput.additionalContext -match 'Recovery Card: project-b') 'absolute project paths should be injected after compact'
+    $legacyContext = [string]$absoluteOutput.hookSpecificOutput.additionalContext
+    $legacyCardContext = $legacyContext.Substring($legacyContext.IndexOf('Recovery Card: project-b'))
+    Assert-True ($legacyCardContext -match 'Recent files \(12\):' -and $legacyCardContext -notmatch [regex]::Escape($Workspace) -and $legacyCardContext -notmatch 'schemaVersion') 'legacy cards must be shortened during injection before their next edit'
+    $restoreProjectA = $base.Clone(); $restoreProjectA.hook_event_name = 'PostToolUse'; $restoreProjectA.tool_input = @{ command = "*** Update File: project-a\probe.txt`n+still-active" }; $restoreProjectA.tool_response = @{ success = $true }
+    Invoke-InstalledHook $restoreProjectA | Out-Null
+    $outside = $base.Clone(); $outside.hook_event_name = 'PostToolUse'; $outside.tool_input = @{ command = "*** Add File: $(Join-Path $TestRoot 'outside.txt')`n+blocked" }; $outside.tool_response = @{ success = $true }
+    Invoke-InstalledHook $outside | Out-Null
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $toolRoot 'recovery\outside.json'))) 'workspace-external absolute paths must not create recovery cards'
+    $failed = $base.Clone(); $failed.hook_event_name = 'PostToolUse'; $failed.tool_input = @{ command = "*** Add File: project-a\ignored.txt`n+x" }; $failed.tool_response = @{ success = $false }
+    Invoke-InstalledHook $failed | Out-Null
+    $card = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
+    Assert-True (-not ($card.files -contains 'ignored.txt')) 'failed edit must not update a recovery card'
+    $docs = $base.Clone(); $docs.hook_event_name = 'PostToolUse'; $docs.tool_input = @{ command = "*** Add File: docs\ignored.md`n+x" }; $docs.tool_response = @{ success = $true }
+    Invoke-InstalledHook $docs | Out-Null
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $toolRoot 'recovery\docs.json'))) 'shared docs must not become a project'
+    $toolEdit = $base.Clone(); $toolEdit.hook_event_name = 'PostToolUse'; $toolEdit.tool_input = @{ command = "*** Add File: .agents\skills\better-compact\ignored.txt`n+x" }; $toolEdit.tool_response = @{ success = $true }
+    Invoke-InstalledHook $toolEdit | Out-Null
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $toolRoot 'recovery\.agents.json'))) 'tool directory must not become a project'
+
+    foreach ($index in 1..13) {
+        $recent = $base.Clone(); $recent.hook_event_name = 'PostToolUse'; $recent.tool_input = @{ command = "*** Add File: project-a\recent-$index.txt`n+x" }; $recent.tool_response = @{ success = $true }
+        Invoke-InstalledHook $recent | Out-Null
+    }
+    $card = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
+    Assert-True ($card.schemaVersion -eq 2) 'rewritten cards must use the compact schema version'
+    Assert-True (@($card.files).Count -eq 12) 'recovery cards must retain only the twelve newest files'
+    Assert-True ($card.files -contains 'recent-13.txt') 'recovery cards must retain the newest file'
+    Assert-True (-not ($card.files -contains 'recent-1.txt')) 'recovery cards must discard the oldest file beyond the cap'
+
+    $compact = @{ hook_event_name = 'PreCompact'; session_id = 'test-session'; cwd = $Workspace; trigger = 'manual' }
+    Invoke-InstalledHook $compact | Out-Null
+    $card = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$card.lastCompactedAt)) 'PreCompact should mark the active recovery card'
+    $resume = @{ hook_event_name = 'SessionStart'; session_id = 'test-session'; cwd = $Workspace; source = 'compact' }
+    $output = (Invoke-InstalledHook $resume | Select-Object -Last 1) | ConvertFrom-Json
+    $context = [string]$output.hookSpecificOutput.additionalContext
+    Assert-True ($context -notmatch 'README-MUST-NOT-INJECT') 'README must not be reinjected'
+    $expectedPrompt = [System.IO.File]::ReadAllText((Join-Path $toolRoot 'prompts\task-state.md'), (New-Object System.Text.UTF8Encoding($false))).Trim()
+    Assert-True ($context.Contains($expectedPrompt)) 'Windows PowerShell hook must inject the exact UTF-8 TASK_STATE management prompt'
+    $rootIndex = $context.IndexOf('# 根规则'); $projectIndex = $context.IndexOf('# 项目规则'); $promptIndex = $context.IndexOf('TASK_STATE management prompt'); $stateIndex = $context.IndexOf('# 项目任务状态'); $cardIndex = $context.IndexOf('Recovery Card: project-a')
+    Assert-True ($rootIndex -lt 0 -and $projectIndex -lt 0 -and $promptIndex -ge 0 -and $promptIndex -lt $stateIndex -and $stateIndex -lt $cardIndex) "resume injection must leave AGENTS.md to Codex and order TASK_STATE prompt, TASK_STATE, recovery card (indices: $rootIndex, $projectIndex, $promptIndex, $stateIndex, $cardIndex)"
+    $cardContext = $context.Substring($cardIndex)
+    Assert-True ($cardContext -match 'Recent files \(12\):' -and $cardContext -notmatch 'schemaVersion' -and $cardContext -notmatch [regex]::Escape($Workspace)) 'recovery context must be a short card without raw JSON or absolute paths'
+    $startup = @{ hook_event_name = 'SessionStart'; session_id = 'test-session'; cwd = $Workspace; source = 'startup' }
+    Assert-True ((Invoke-InstalledHook $startup).Count -eq 0) 'startup must not inject context'
+
+    Invoke-Controller SetTaskState $false | Out-Null
+    $taskOff = (Invoke-InstalledHook $resume | Select-Object -Last 1) | ConvertFrom-Json
+    Assert-True ($taskOff.hookSpecificOutput.additionalContext -notmatch 'TASK_STATE management prompt') ("TASK_STATE off must skip management prompt; status=" + ((Invoke-Controller Status | Out-String).Trim()))
+    Assert-True ($taskOff.hookSpecificOutput.additionalContext -notmatch '# Project task state') 'TASK_STATE off must skip project state'
+    Assert-True ($taskOff.hookSpecificOutput.additionalContext -match 'Recovery Card: project-a') 'TASK_STATE off must retain recovery card'
+    Invoke-Controller SetCore $false | Out-Null
+    $logPath = Join-Path $toolRoot 'logs\continuity-diagnostic.jsonl'; $logLength = (Get-Item -LiteralPath $logPath).Length
+    $coreOff = $base.Clone(); $coreOff.hook_event_name = 'PostToolUse'; $coreOff.tool_input = @{ command = "*** Add File: project-a\core-off.txt`n+x" }; $coreOff.tool_response = @{ success = $true }
+    Assert-True ((Invoke-InstalledHook $coreOff).Count -eq 0) 'Core off must have no hook output'
+    $card = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
+    Assert-True (-not ($card.files -contains 'project-a\core-off.txt')) 'Core off must not update recovery data'
+    Assert-True ((Get-Item -LiteralPath $logPath).Length -eq $logLength) 'Core off must not write diagnostics'
+    Invoke-Controller SetCore $true | Out-Null
+    $invalidPayloadMarker = 'MUST-NOT-APPEAR-IN-DIAGNOSTICS'
+    Invoke-InstalledHookRaw ("{invalid-json:$invalidPayloadMarker}") | Out-Null
+    $invalidEntry = Get-Content -LiteralPath $logPath -Tail 1 | ConvertFrom-Json
+    Assert-True ($invalidEntry.stage -eq 'Dispatch' -and $invalidEntry.outcome -eq 'failed') 'invalid Hook JSON should record a dispatch failure'
+    Assert-True ($invalidEntry.detail -match '^reason=invalid-hook-json; inputLength=\d+$') 'invalid Hook JSON diagnostics should be bounded to the input length'
+    Assert-True ($invalidEntry.detail -notmatch $invalidPayloadMarker) 'invalid Hook JSON diagnostics must not store raw payload content'
+    Remove-Item -LiteralPath (Join-Path $toolRoot 'config\workspace.json') -Force
+    $missingConfig = (Invoke-InstalledHook $resume | Select-Object -Last 1) | ConvertFrom-Json
+    Assert-True ($missingConfig.hookSpecificOutput.additionalContext -match 'TASK_STATE management prompt') 'missing config must default TASK_STATE to ON'
+    Set-Content -LiteralPath (Join-Path $toolRoot 'config\workspace.json') -Value '{bad json' -Encoding utf8
+    Assert-True ((Invoke-Controller Status | Out-String) -match 'Core: ON') 'corrupt config must default Core to ON'
+
+    $preUpgradeCardHash = (Get-FileHash -LiteralPath $cardPath).Hash
+    $preUpgradeLogLength = (Get-Item -LiteralPath $logPath).Length
+    & $Installer -WorkspaceRoot $Workspace -ExistingHooksAction Merge
+    Assert-True ((Get-Content -LiteralPath (Join-Path $toolRoot 'config\workspace.json') -Raw) -match '^\{bad json') 'install should retain corrupt config for runtime fallback, not overwrite it'
+    Assert-True ((Get-FileHash -LiteralPath $cardPath).Hash -eq $preUpgradeCardHash) 'upgrade should preserve recovery cards'
+    Assert-True ((Get-Item -LiteralPath $logPath).Length -eq $preUpgradeLogLength) 'upgrade should preserve diagnostic logs'
+    $interactiveInstall = Invoke-InteractiveInstaller
+    Assert-True ($interactiveInstall.exitCode -eq 0) 'interactive installer should complete successfully'
+    $installerSource = Get-Content -LiteralPath $Installer -Raw
+    Assert-True ($installerSource -notmatch 'InstallScope|输入 G 或 W|选择安装类型') 'installer should have no global-only choice or scope selector'
+    Assert-True ($installerSource.Contains('请输入codex工作区路径，例如：D:\codex workspace')) 'interactive installer should show the workspace path example'
+    Assert-True ($installerSource.Contains('安装完成，按 Enter 关闭窗口')) 'interactive installer should wait before closing'
+    Assert-True ($installerSource.Contains('安装并保留其他 Hook，请输入 M 后回车；输入 C 取消')) 'interactive installer should explain the merge and cancel choices in Chinese'
+    Assert-True (Test-Path -LiteralPath $Launcher -PathType Leaf) 'the distribution should include a double-click installer launcher'
+    Assert-True (Test-Path -LiteralPath $UninstallLauncher -PathType Leaf) 'the distribution should include a double-click migration uninstaller launcher'
+    Assert-True (Test-Path -LiteralPath $MigrationUninstaller -PathType Leaf) 'the distribution should include the migration uninstaller'
+    $launcherInstall = Invoke-InteractiveInstaller -UseLauncher
+    Assert-True ($launcherInstall.exitCode -eq 0) 'double-click installer launcher should complete successfully'
+    $unknownWorkspace = Join-Path $TestRoot 'unknown-workspace'
+    New-Item -ItemType Directory -Force -Path (Join-Path $unknownWorkspace '.agents\skills\better-compact') | Out-Null
+    $unknownFailed = $false
+    try { & $Installer -WorkspaceRoot $unknownWorkspace -ExistingHooksAction Merge } catch { $unknownFailed = $true }
+    Assert-True $unknownFailed 'installer must refuse an unknown existing Better Compact directory'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $unknownWorkspace '.agents\skills\better-compact\install\install.json'))) 'unknown directory must remain untouched'
+    $interactiveError = Invoke-InteractiveInstaller -TargetWorkspace $unknownWorkspace
+    Assert-True ($interactiveError.exitCode -eq 1) 'interactive installer should return a failure status after an installation error'
+    Assert-True ($installerSource.Contains('安装失败：')) 'interactive installer should show a readable installation error'
+
+    & $MigrationUninstaller
+    Assert-True (-not (Test-Path -LiteralPath $toolRoot)) 'migration uninstaller should remove the workspace-local Better Compact directory'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $secondWorkspace '.agents\skills\better-compact'))) 'migration uninstaller should remove every registered workspace installation'
+    Assert-True (Test-Path -LiteralPath (Join-Path $globalSkillRoot 'SKILL.md')) 'workspace uninstall must retain the global Skill'
+    $hooks = Read-Utf8Json (Join-Path $codexHome 'hooks.json')
+    Assert-True ($hooks.hooks.SessionStart[0].hooks.command -eq 'echo user-hook') 'uninstaller must preserve user hooks'
+    Assert-True ($hooks.hooks.SessionStart[0].hooks.statusMessage -eq '用户钩子') 'uninstaller must preserve UTF-8 Chinese content from existing hooks.json'
+    Assert-True ($null -eq $hooks.hooks.PSObject.Properties['PreToolUse']) 'uninstaller must not add or retain a Better Compact PreToolUse hook'
+    $remainingBetterCompactHandlers = New-Object System.Collections.Generic.List[object]
+    foreach ($eventProperty in @($hooks.hooks.PSObject.Properties)) {
+        foreach ($group in @($eventProperty.Value)) {
+            foreach ($handler in @($group.hooks)) {
+                if ([string]$handler.command -match '(?i)\\.agents\\skills\\better-compact\\runtime\\continuity\.ps1') { [void]$remainingBetterCompactHandlers.Add($handler) }
+            }
+        }
+    }
+    Assert-True ($remainingBetterCompactHandlers.Count -eq 0) 'migration uninstaller must remove every Better Compact Hook handler'
+    Write-Host 'PASS: global Skill registration, workspace installation, switches, three-hook lifecycle, recovery injection, upgrade safety, and migration-safe uninstall.' -ForegroundColor Green
+} finally {
+    $env:USERPROFILE = $OriginalUserProfile
+    if ((Test-Path -LiteralPath $TestRoot) -and $TestRoot.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) { Remove-Item -LiteralPath $TestRoot -Recurse -Force }
+}
